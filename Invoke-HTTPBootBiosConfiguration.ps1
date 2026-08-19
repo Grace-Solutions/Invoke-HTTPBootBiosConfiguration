@@ -12,9 +12,10 @@
     For Dell devices, the following operations are then performed by using CCTK:
 
       1. Locates cctk.exe from the staged toolkit tools directory (architecture specific first), the process path, or the standard installation directories.
-      2. Downloads the certificate authority root certificate (the Let's Encrypt "ISRG Root X1" certificate by default) so that the BIOS can validate the TLS certificate presented by the HTTP(s) boot server.
-      3. Generates the HttpBootProfile XML document containing the boot URL, the root certificate, and the integrity information section. The digest is intentionally left empty - this script places configuration values only and does not download or hash the boot image.
-      4. Executes the CCTK commands to enable HTTPS boot, set the HTTPS boot mode to manual, delete any existing HTTP boot profile (this avoids a known issue where updating the URL within an existing profile does not always apply), apply the new profile, and read the profile back to verify that the configured URL was applied.
+      2. Determines the certificate authority root certificate that the BIOS uses to validate the TLS certificate presented by the HTTP(s) boot server. When a root certificate URL was not explicitly specified, the certificate chain is retrieved directly from the boot endpoint by using the Get-EndpointCertificateChain toolkit function (the full chain is exported to PEM format within the staging directory, and the root of the chain is embedded within the profile). When the endpoint retrieval fails, the root certificate is downloaded from the RootCertificateURL as a graceful fallback (the Let's Encrypt "ISRG Root X1" certificate by default).
+      3. Determines the boot image digest. The BIOS requires a non-empty digest value within the profile integrity information (verified on hardware - an empty digest is rejected with "some or all fields missing"), so the SHA-256 digest of the boot image is computed by downloading it from the boot URL, unless a precomputed value is supplied by using the BootImageDigest parameter.
+      4. Generates the HttpBootProfile XML document containing the boot URL, the root certificate, and the integrity information section.
+      5. Executes the CCTK commands to enable HTTPS boot, set the HTTPS boot mode to manual, delete any existing HTTP boot profile (this avoids a known issue where updating the URL within an existing profile does not always apply), apply the new profile, and read the profile back to verify that the configured URL was applied.
 
     All downloads automatically honor the proxy configuration of the environment. The proxy configuration of the current user (a static WinINET proxy or an automatic configuration script) is preferred, followed by the machine WinHTTP proxy configuration (as set by "netsh winhttp set proxy"), and no proxy is used when neither is configured. Default credentials are supplied to authenticating proxies.
 
@@ -24,7 +25,7 @@
     Required. The fully qualified HTTP(s) URL of the UEFI boot image the BIOS will boot from. Example: https://prod.ipxe.example.com/2PXE/boot/x64/snponly_x64.efi. When the URL does not end with a file name (for example https://prod.ipxe.example.com/2PXE/boot/x64, with or without a trailing slash), the default boot image file name of "snponly_x64.efi" is appended automatically. Alias: URL, BURL.
 
     .PARAMETER RootCertificateURL
-    Optional. The URL of the PEM encoded certificate authority root certificate that the BIOS uses to validate the TLS certificate presented by the HTTP(s) boot server. Defaults to the Let's Encrypt "ISRG Root X1" root certificate at https://letsencrypt.org/certs/isrgrootx1.pem. Alias: RCURL.
+    Optional. The URL of the PEM encoded certificate authority root certificate that the BIOS uses to validate the TLS certificate presented by the HTTP(s) boot server. When this parameter is NOT explicitly specified, the certificate chain is retrieved directly from the boot endpoint instead, and this URL (the Let's Encrypt "ISRG Root X1" root certificate at https://letsencrypt.org/certs/isrgrootx1.pem by default) is only used as a graceful fallback when the endpoint retrieval fails. Explicitly specifying this parameter skips the endpoint retrieval entirely. Alias: RCURL.
 
     .PARAMETER CCTKDownloadURL
     Optional. The URL that the Dell Command | Configure content is downloaded from when cctk.exe cannot be located on the device. Supports a Dell Update Package executable (.exe), a ZIP archive (.zip), or a 7-Zip archive (.7z) containing a previously extracted portable "Command Configure" folder. Defaults to the Dell Command | Configure version 5.2.2 Dell Update Package hosted at dl.dell.com. Alias: CCTKURL.
@@ -34,6 +35,9 @@
 
     .PARAMETER StagingDirectory
     Optional. The directory that downloaded and extracted content is staged within. Keep this path short, because the MSI administrative extraction can fail with "path too long" errors when the staging path is deep. Defaults to "$($Env:Windir)\Temp\HTTPBootBios". Alias: SD.
+
+    .PARAMETER BootImageDigest
+    Optional. A precomputed SHA-256 digest (64 hexadecimal characters) of the boot image, placed directly into the profile integrity information without downloading the boot image. When not specified, the boot image is downloaded from the boot URL and its digest is computed. The BIOS requires a non-empty digest value, and enforces it against the downloaded boot image at boot time - a stale digest stops the device from HTTP booting until the profile is re-applied. Alias: BID, Digest.
 
     .PARAMETER SetupPassword
     Optional. The BIOS setup (administrator) password. When specified, it is appended to each BIOS modification command by using the --ValSetupPwd argument, and the process command lines are obfuscated within the log. This parameter is safe to supply fleet wide: CCTK ignores the --ValSetupPwd argument on devices where no setup password is installed (verified on version 5.2.2), so the same command line works on both password protected and unprotected devices. When this parameter is omitted, the argument is not appended at all, which also works on unprotected devices. Alias: BIOSPassword, SP.
@@ -70,6 +74,10 @@
 
     .NOTES
     All Dell Command | Configure exit codes other than 0 indicate an error. Exit code 150 means "Profile Not Present" and is accepted for the profile deletion command, because a device that has never been configured will not have an existing profile.
+
+    Dell BIOS HTTP boot profile certificate import requires RSA certificates. When the certificate that will be embedded does not use an RSA public key (for example ECDSA), a warning is logged and the certificate is still exported and embedded, however the BIOS may reject the profile with a "not RSA format" error.
+
+    The following HTTP boot profile constraints were verified on hardware (CCTK 5.2.2): the certificate field accepts a maximum of 2047 characters, so only a single certificate (the root) can be embedded - a chain bundle does not fit and is rejected with exit code 150 ("field certificate max allowed characters are 2047"). The IntegrityInfo element and a non-empty digest value are mandatory - profiles without them are rejected with exit code 157 ("some or all fields missing").
 
     The default Dell Command | Configure download details (version 5.2.2 A00, released 2026-03-31) were retrieved from the Dell support site (driver ID F2V9N) and validated end to end.
 
@@ -112,6 +120,11 @@
         [ValidateNotNullOrEmpty()]
         [Alias('SD')]
         [System.IO.DirectoryInfo]$StagingDirectory,
+
+        [Parameter(Mandatory=$False)]
+        [ValidateNotNullOrEmpty()]
+        [Alias('BID', 'Digest')]
+        [String]$BootImageDigest,
 
         [Parameter(Mandatory=$False)]
         [ValidateNotNullOrEmpty()]
@@ -690,45 +703,92 @@ Switch (Test-ProcessElevationStatus)
                                       }
                                   #endregion
 
-                                  #region Download the certificate authority root certificate (Only required for HTTPS boot URLs)
+                                  #region Determine the certificate authority root certificate (Only required for HTTPS boot URLs)
                                     [String]$RootCertificateContent = [System.String]::Empty
 
                                     Switch ($BootURL.Scheme -ieq 'https')
                                       {
                                           {($_ -eq $True)}
                                             {
-                                                [System.IO.FileInfo]$RootCertificatePath = [System.IO.Path]::Combine("$($StagingDirectory.FullName)", 'RootCertificate.pem')
+                                                #region Retrieve the certificate chain directly from the boot endpoint (When a root certificate URL was not explicitly specified)
+                                                  Switch ($PSBoundParameters.ContainsKey('RootCertificateURL'))
+                                                    {
+                                                        {($_ -eq $False)}
+                                                          {
+                                                              $WriteLogMessage.Invoke(0, @("A root certificate URL was not explicitly specified. Attempting to retrieve the certificate chain directly from the boot endpoint. Please Wait..."))
 
-                                                $Null = $DownloadFile.InvokeReturnAsIs($RootCertificateURL, $RootCertificatePath)
+                                                              #The endpoint probe is always made directly (never through a proxy), because the BIOS HTTP(s) boot feature contacts the endpoint directly as well.
+                                                              $GetEndpointCertificateChainParameters = New-Object -TypeName 'System.Collections.Specialized.OrderedDictionary'
+                                                                $GetEndpointCertificateChainParameters.URL = $BootURL
+                                                                $GetEndpointCertificateChainParameters.ExportPath = [System.IO.FileInfo][System.IO.Path]::Combine("$($StagingDirectory.FullName)", 'BootEndpointCertificateChain.pem')
+                                                                $GetEndpointCertificateChainParameters.ContinueOnError = $True
+                                                                $GetEndpointCertificateChainParameters.Verbose = $True
 
-                                                [String]$RootCertificateContent = [System.IO.File]::ReadAllText($RootCertificatePath.FullName).Trim()
+                                                              $GetEndpointCertificateChainResult = Get-EndpointCertificateChain @GetEndpointCertificateChainParameters
 
-                                                Switch ($RootCertificateContent -imatch '(?s)(^.*-----BEGIN CERTIFICATE-----.*-----END CERTIFICATE-----.*$)')
-                                                  {
-                                                      {($_ -eq $False)}
-                                                        {
-                                                            Throw "The content downloaded from `"$($RootCertificateURL.AbsoluteUri)`" does not appear to be a PEM encoded certificate."
-                                                        }
-                                                  }
+                                                              Switch (($GetEndpointCertificateChainResult.Succeeded -eq $True) -and ($Null -ine $GetEndpointCertificateChainResult.RootCertificate))
+                                                                {
+                                                                    {($_ -eq $True)}
+                                                                      {
+                                                                          [String]$RootCertificateContent = "$($GetEndpointCertificateChainResult.RootCertificate.PEMContent)".Trim()
 
-                                                Try
-                                                  {
-                                                      $RootCertificateObject = New-Object -TypeName 'System.Security.Cryptography.X509Certificates.X509Certificate2' -ArgumentList @("$($RootCertificatePath.FullName)")
+                                                                          $WriteLogMessage.Invoke(0, @("The root certificate retrieved from the boot endpoint will be embedded within the HTTP boot profile.", "Subject: $($GetEndpointCertificateChainResult.RootCertificate.Subject)", "Key Algorithm: $($GetEndpointCertificateChainResult.RootCertificate.KeyAlgorithm)", "Thumbprint: $($GetEndpointCertificateChainResult.RootCertificate.Thumbprint)"))
+                                                                      }
 
-                                                      $WriteLogMessage.Invoke(0, @("Root Certificate Subject: $($RootCertificateObject.Subject)", "Root Certificate Thumbprint: $($RootCertificateObject.Thumbprint)", "Root Certificate Expiration: $($RootCertificateObject.NotAfter.ToString('o'))"))
+                                                                    Default
+                                                                      {
+                                                                          $WriteLogMessage.Invoke(2, @("The certificate chain could not be retrieved from the boot endpoint. Falling back to downloading the root certificate from `"$($RootCertificateURL.AbsoluteUri)`"."))
+                                                                      }
+                                                                }
+                                                          }
+                                                    }
+                                                #endregion
 
-                                                      Switch ($RootCertificateObject.NotAfter -lt (Get-Date))
-                                                        {
-                                                            {($_ -eq $True)}
-                                                              {
-                                                                  $WriteLogMessage.Invoke(2, @("The root certificate downloaded from `"$($RootCertificateURL.AbsoluteUri)`" has expired. The BIOS may not be able to validate the HTTP(s) boot server."))
-                                                              }
-                                                        }
-                                                  }
-                                                Catch
-                                                  {
-                                                      $WriteLogMessage.Invoke(2, @("The downloaded root certificate could not be parsed for informational logging purposes. The certificate content will still be embedded within the HTTP boot profile.", "Message: $($_.Exception.Message)"))
-                                                  }
+                                                #region Download the root certificate (When it was not retrieved from the boot endpoint)
+                                                  Switch (([System.String]::IsNullOrEmpty($RootCertificateContent) -eq $True) -or ([System.String]::IsNullOrWhiteSpace($RootCertificateContent) -eq $True))
+                                                    {
+                                                        {($_ -eq $True)}
+                                                          {
+                                                              [System.IO.FileInfo]$RootCertificatePath = [System.IO.Path]::Combine("$($StagingDirectory.FullName)", 'RootCertificate.pem')
+
+                                                              $Null = $DownloadFile.InvokeReturnAsIs($RootCertificateURL, $RootCertificatePath)
+
+                                                              [String]$RootCertificateContent = [System.IO.File]::ReadAllText($RootCertificatePath.FullName).Trim()
+
+                                                              Switch ($RootCertificateContent -imatch '(?s)(^.*-----BEGIN CERTIFICATE-----.*-----END CERTIFICATE-----.*$)')
+                                                                {
+                                                                    {($_ -eq $False)}
+                                                                      {
+                                                                          Throw "The content downloaded from `"$($RootCertificateURL.AbsoluteUri)`" does not appear to be a PEM encoded certificate."
+                                                                      }
+                                                                }
+
+                                                              Try
+                                                                {
+                                                                    $RootCertificateObject = New-Object -TypeName 'System.Security.Cryptography.X509Certificates.X509Certificate2' -ArgumentList @("$($RootCertificatePath.FullName)")
+
+                                                                    $WriteLogMessage.Invoke(0, @("Root Certificate Subject: $($RootCertificateObject.Subject)", "Root Certificate Thumbprint: $($RootCertificateObject.Thumbprint)", "Root Certificate Expiration: $($RootCertificateObject.NotAfter.ToString('o'))"))
+
+                                                                    Switch ($True)
+                                                                      {
+                                                                          {($RootCertificateObject.PublicKey.Oid.Value -ine '1.2.840.113549.1.1.1')}
+                                                                            {
+                                                                                $WriteLogMessage.Invoke(2, @("The root certificate downloaded from `"$($RootCertificateURL.AbsoluteUri)`" does not use an RSA public key. Dell BIOS HTTP boot profile certificate import requires RSA certificates, so the BIOS may reject this certificate with a `"not RSA format`" error. The certificate will still be embedded."))
+                                                                            }
+
+                                                                          {($RootCertificateObject.NotAfter -lt (Get-Date))}
+                                                                            {
+                                                                                $WriteLogMessage.Invoke(2, @("The root certificate downloaded from `"$($RootCertificateURL.AbsoluteUri)`" has expired. The BIOS may not be able to validate the HTTP(s) boot server."))
+                                                                            }
+                                                                      }
+                                                                }
+                                                              Catch
+                                                                {
+                                                                    $WriteLogMessage.Invoke(2, @("The downloaded root certificate could not be parsed for informational logging purposes. The certificate content will still be embedded within the HTTP boot profile.", "Message: $($_.Exception.Message)"))
+                                                                }
+                                                          }
+                                                    }
+                                                #endregion
                                             }
 
                                           Default
@@ -738,8 +798,51 @@ Switch (Test-ProcessElevationStatus)
                                       }
                                   #endregion
 
+                                  #region Determine the boot image digest (The BIOS requires a non-empty digest value)
+                                    #Verified on hardware: applying a profile with an empty digest, or without the IntegrityInfo element entirely, fails with CCTK exit code 157 ("some or all fields missing"). A digest value is therefore mandatory. It is computed from the boot image by default, or placed directly when the BootImageDigest parameter is specified.
+                                    Switch (([System.String]::IsNullOrEmpty($BootImageDigest) -eq $False) -and ([System.String]::IsNullOrWhiteSpace($BootImageDigest) -eq $False))
+                                      {
+                                          {($_ -eq $True)}
+                                            {
+                                                [String]$BootImageDigest = $BootImageDigest.Trim().ToLower()
+
+                                                $WriteLogMessage.Invoke(0, @("The specified boot image digest will be placed within the HTTP boot profile without downloading the boot image. [Digest: $($BootImageDigest)]"))
+
+                                                Switch ($BootImageDigest -inotmatch '(^[0-9a-f]{64}$)')
+                                                  {
+                                                      {($_ -eq $True)}
+                                                        {
+                                                            $WriteLogMessage.Invoke(2, @("The specified boot image digest does not appear to be a valid SHA-256 value (64 hexadecimal characters). The BIOS may reject the profile."))
+                                                        }
+                                                  }
+                                            }
+
+                                          Default
+                                            {
+                                                [String]$BootImageFileName = [System.IO.Path]::GetFileName($BootURL.LocalPath)
+
+                                                [System.IO.FileInfo]$BootImagePath = [System.IO.Path]::Combine("$($StagingDirectory.FullName)", $BootImageFileName)
+
+                                                $Null = $DownloadFile.InvokeReturnAsIs($BootURL, $BootImagePath)
+
+                                                [String]$BootImageDigest = (Get-FileHash -Path ($BootImagePath.FullName) -Algorithm SHA256).Hash.ToLower()
+
+                                                $WriteLogMessage.Invoke(0, @("Boot Image Digest (SHA-256): $($BootImageDigest)"))
+                                            }
+                                      }
+                                  #endregion
+
                                   #region Generate the HTTP boot profile document
-                                    #The document is built with an XmlDocument and written through an XmlWriter. The digest within the integrity information is intentionally left empty - this script places configuration values only and does not download or hash the boot image. The profile schema requires the IntegrityInfo element but allows an empty digest value.
+                                    #The document is built with an XmlDocument and written through an XmlWriter.
+                                    #Verified on hardware: the BIOS certificate field accepts a maximum of 2047 characters, so only a single certificate (the root) can be embedded - a multiple certificate bundle does not fit and is rejected by CCTK with "field certificate max allowed characters are 2047".
+                                    Switch (([System.String]::IsNullOrWhiteSpace($RootCertificateContent) -eq $False) -and ($RootCertificateContent.Length -gt 2047))
+                                      {
+                                          {($_ -eq $True)}
+                                            {
+                                                $WriteLogMessage.Invoke(2, @("The certificate content is $($RootCertificateContent.Length) characters long, which exceeds the BIOS certificate field maximum of 2047 characters. The profile application will likely fail."))
+                                            }
+                                      }
+
                                     [System.IO.FileInfo]$HttpBootProfilePath = [System.IO.Path]::Combine("$($StagingDirectory.FullName)", 'HttpBootProfile.xml')
 
                                     $HttpBootProfileDocument = New-Object -TypeName 'System.Xml.XmlDocument'
@@ -787,6 +890,7 @@ Switch (Test-ProcessElevationStatus)
                                     $Null = $IntegrityInfoElement.AppendChild($AlgorithmElement)
 
                                     $DigestElement = $HttpBootProfileDocument.CreateElement('Digest')
+                                      $DigestElement.InnerText = "$($BootImageDigest)"
 
                                     $Null = $IntegrityInfoElement.AppendChild($DigestElement)
 

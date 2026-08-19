@@ -19,9 +19,10 @@ A manufacturer switch statement selects the configuration method per device vend
 Then, for Dell devices:
 
 1. **Locate CCTK** - the staged `Toolkit\Tools\<architecture>\CCTK` folder first (the toolkit resolves `X86`, `X64`, or `ARM64` automatically), then the process path, then the standard installation directories.
-2. **Download the root certificate** - the Let's Encrypt "ISRG Root X1" PEM by default, so the BIOS can validate the TLS certificate presented by the boot server.
-3. **Generate the HTTP boot profile XML** - built with an XmlDocument and written through an XmlWriter. The integrity digest is intentionally left empty: the script places configuration values only and does not download or hash the boot image. See [Docs/HttpBootProfile-Reference.md](Docs/HttpBootProfile-Reference.md) for the document format.
-4. **Apply the BIOS configuration** by executing the following CCTK commands in order:
+2. **Determine the root certificate** - when `-RootCertificateURL` is not explicitly specified, the `Get-EndpointCertificateChain` toolkit function performs a direct TLS handshake against the boot endpoint (exactly what the firmware will do - no proxy), captures the presented certificate chain, exports it to PEM (the full chain is written to the staging directory), and embeds the chain's self-signed root into the profile. If the endpoint cannot be reached, it gracefully falls back to downloading `-RootCertificateURL` (Let's Encrypt "ISRG Root X1" by default). Dell BIOS certificate import requires RSA - non-RSA (e.g. ECDSA) certificates are still exported and embedded, with a warning.
+3. **Determine the boot image digest** - the BIOS requires a non-empty SHA-256 digest in the profile (hardware verified: an empty digest is rejected with exit 157 "some or all fields missing"), so the boot image is downloaded and hashed - unless a precomputed value is supplied with `-BootImageDigest`, which places the value without downloading anything.
+4. **Generate the HTTP boot profile XML** - built with an XmlDocument and written through an XmlWriter. See [Docs/HttpBootProfile-Reference.md](Docs/HttpBootProfile-Reference.md) for the document format and the hardware verified field constraints (single certificate only - the BIOS cert field is capped at 2047 characters, so a chain bundle cannot be embedded).
+5. **Apply the BIOS configuration** by executing the following CCTK commands in order:
 
    | # | Command | Notes |
    | --- | --- | --- |
@@ -54,10 +55,11 @@ powershell.exe -ExecutionPolicy Bypass -NoProfile -NoLogo -File ".\Invoke-HTTPBo
 | Parameter | Default | Description |
 | --- | --- | --- |
 | `-BootURL` | (required) | Fully qualified HTTP(s) URL of the UEFI boot image, e.g. `https://prod.ipxe.example.com/2PXE/boot/x64/snponly_x64.efi`. When the URL does not end with a file name, `snponly_x64.efi` is appended automatically |
-| `-RootCertificateURL` | Let's Encrypt ISRG Root X1 (`https://letsencrypt.org/certs/isrgrootx1.pem`) | PEM encoded CA root certificate the BIOS uses to validate the boot server TLS certificate |
+| `-RootCertificateURL` | Let's Encrypt ISRG Root X1 (`https://letsencrypt.org/certs/isrgrootx1.pem`) | PEM encoded CA root certificate the BIOS uses to validate the boot server TLS certificate. When NOT explicitly specified, the chain is fetched directly from the boot endpoint instead, and this URL is only the graceful fallback; specifying it skips the endpoint retrieval |
 | `-CCTKDownloadURL` | Dell Command \| Configure 5.2.2 DUP on `dl.dell.com` | Source for the dynamic CCTK acquisition. Supports `.exe` (DUP), `.zip`, and `.7z` |
 | `-SevenZipDownloadURL` | `https://www.7-zip.org/a/7zr.exe` | Portable 7-Zip console executable used for payload extraction |
 | `-StagingDirectory` | `%WINDIR%\Temp\HTTPBootBios` | Working directory for downloads and extraction. Keep it short (MSI extraction fails on deep paths) |
+| `-BootImageDigest` | (computed) | Precomputed SHA-256 of the boot image (64 hex chars), placed into the profile without downloading the boot image. When omitted, the boot image is downloaded and hashed. The BIOS enforces the digest at boot time - a stale value stops HTTP boot until the profile is re-applied |
 | `-SetupPassword` | (none) | BIOS setup password, appended as `--ValSetupPwd=` on modification commands. Safe to supply fleet-wide: CCTK ignores the argument on devices with no setup password installed (verified on 5.2.2) |
 | `-SkipProfileDeletion` | off | Do not delete the existing HTTP boot profile before applying |
 | `-LogDirectory` | auto (toolkit) | Log folder override |
