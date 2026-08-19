@@ -52,3 +52,7 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+
+# Dynamically staged tool binaries (cannot be redistributed; staged at execution time by Invoke-ToolStaging)
+# The Toolkit/Tools/X86, X64, and ARM64 folders are already covered by the build-results directory rules above.
+Toolkit/Tools/All/7-Zip/

@@ -316,7 +316,28 @@ Try
       #endregion
 
       #region Define Variables
-          $OSArchitecture = $($OperatingSystem.OSArchitecture).Replace("-bit", "").Replace("32", "86").Insert(0,"x").ToUpper()
+          #Determine the operating system architecture (X86, X64, or ARM64) for architecture specific tool selection
+          :OSArchitectureSwitch Switch -Regex ("$($OperatingSystem.OSArchitecture)")
+            {
+                '(^.*ARM.*64.*$)'
+                  {
+                      $OSArchitecture = 'ARM64'
+
+                      Break OSArchitectureSwitch
+                  }
+
+                '(^.*64.*$)'
+                  {
+                      $OSArchitecture = 'X64'
+
+                      Break OSArchitectureSwitch
+                  }
+
+                Default
+                  {
+                      $OSArchitecture = 'X86'
+                  }
+            }
           $ContentDirectory = [System.IO.DirectoryInfo][System.IO.Path]::Combine($ToolkitScriptDirectory.Parent.FullName, 'Content')
           $FunctionsDirectory = [System.IO.DirectoryInfo][System.IO.Path]::Combine($ToolkitScriptDirectory.FullName, 'Functions')
           $ModulesDirectory = [System.IO.DirectoryInfo][System.IO.Path]::Combine($ToolkitScriptDirectory.FullName, 'Modules')
